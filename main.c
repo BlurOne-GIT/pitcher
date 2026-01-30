@@ -1,11 +1,15 @@
-#include <stdlib.h>
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
+
 #include "kiss_fftr.h"
+
+#define FLAG_IMPLEMENTATION
+#include "flag.h"
 
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define LN_OF_A (0.057762265046662109118102676788181380672958344530021271176723334124449468497474559633821943916368224)
 #define F0 (440)
@@ -16,8 +20,12 @@ struct userdata {
   float *workbuffer;
   kiss_fft_cpx *fft_out;
   kiss_fftr_cfg *fft_config;
-  const size_t fft_rate;
+  const ma_uint32 fft_rate;
+  const ma_uint32 half_count;
+  const float rms_min;
   size_t write_pos;
+  size_t k_min;
+  size_t k_max;
 };
 
 static int half_steps(float fn) {
@@ -47,37 +55,31 @@ void data_callback(ma_device *pDevice, void *pOutput, const void *pInput, ma_uin
 
   kiss_fftr(*userdata->fft_config, userdata->workbuffer, userdata->fft_out);
 
-  ma_uint32 halfCount = userdata->fft_rate/2 + 1;
-  for (int i = 0; i < halfCount; i++) {
+  for (int i = 0; i < userdata->half_count; i++) {
     kiss_fft_cpx c = userdata->fft_out[i];
     float magnitude = fmaxf(sqrtf(c.r * c.r + c.i * c.i), 1e-12);
-    userdata->workbuffer[i] = magnitude;
-    userdata->workbuffer[i+halfCount] = logf(magnitude);
+    userdata->workbuffer[i+userdata->half_count] = magnitude;
+    userdata->workbuffer[i] = logf(magnitude);
   }
 
   for (int h = 2; h <= 4; h++)
-    for (int i = 0; i * h < halfCount; i++)
-      userdata->workbuffer[i+halfCount] += logf(userdata->workbuffer[i*h]);
-
-  static const float fmin = 130.0f;
-  static const float fmax = 1000.0f;
-
-  const int k_min = (int)(fmin * halfCount / pDevice->sampleRate);
-  const int k_max = (int)(fmax * halfCount / pDevice->sampleRate);
+    for (int i = 0; i * h < userdata->half_count; i++)
+      userdata->workbuffer[i] += logf(userdata->workbuffer[userdata->half_count+i*h]);
 
   int idx;
   float max = -INFINITY;
 
-  for (int i = halfCount + k_min; i < halfCount + k_max; i++) {
-  // for (int i = k_min; i < k_max; i++) {
+  for (int i = userdata->k_min; i < userdata->k_max; i++) {
     if (userdata->workbuffer[i] > max) {
       idx = i;
       max = userdata->workbuffer[i];
     }
   }
 
+  if (max < 0) return;
+
   float delta = 0.0f;
-  if (idx > halfCount && idx < halfCount*2-1) {
+  if (idx > 0 && idx < userdata->half_count-1) {
     float alpha = userdata->workbuffer[idx-1];
     float beta  = userdata->workbuffer[idx];
     float gamma = userdata->workbuffer[idx+1];
@@ -85,7 +87,7 @@ void data_callback(ma_device *pDevice, void *pOutput, const void *pInput, ma_uin
     delta = 0.5f * (alpha - gamma) / (alpha - 2.0f * beta + gamma);
   }
 
-  float i_precise = idx - halfCount + delta;
+  float i_precise = idx + delta;
 
   float pitch_hz = i_precise * pDevice->sampleRate / userdata->fft_rate;
 
@@ -95,29 +97,39 @@ void data_callback(ma_device *pDevice, void *pOutput, const void *pInput, ma_uin
 
   rms = sqrtf(rms / userdata->fft_rate);
 
-  if (rms < 0.001f) {
-    pitch_hz = 0.0f;   // or “no pitch”
-    return;
+  static int n;
+  if (rms >= userdata->rms_min) {
+    n = half_steps(pitch_hz);
   }
 
-  int n = half_steps(pitch_hz);
+  if (n + 57 < 0) return;
+    
+  const static char *notes[12] = {
+    "A", "A#", "B", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#"
+  };
   
-  const static char *notes[12] = {"A", "A#", "B", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#"};
-  
-  printf("\rFC:%5d | %2s%d (%5.1f)", frameCount, notes[((n%12) + 12) % 12], (n+57)/12, pitch_hz);
+  printf("\r%2s%1d (%6.1fHz) | Energy: %f", notes[((n%12) + 12) % 12], (n+57)/12, pitch_hz, rms);
   fflush(stdout);
 }
 
 int main(int argc, char *argv[]) {
-  /*
-    TODO:
-    - parse args for sample rate, fft rate and device
-    - do device enumeration for picking device
-  */
+  // TODO: char **device_name = flag_str("-device", NULL, "Use a specific device for the detection.");
+  uint64_t *sample_rate = flag_uint64("-sampleRate", 0, "The sample rate to use for the device. It uses the device's prefered sample rate by default.");
+  uint64_t *fft_rate_pow = flag_uint64("-fftRate", 13, "2^value of samples to use for the fft.");
+  float *fmin = flag_float("-highpass", 80, "Lowest frequency (in Hz) for the high-pass filter.");
+  float *fmax = flag_float("-lowpass", 1110, "Highest frequency (in Hz) for the low-pass filter.");
+  float *rms_min = flag_float("-rms", .001f, "Minimum rms for loudness filter.");
+  _Bool *help = flag_bool("-help", 0, "Display this help message.");
 
-  ma_result result;
+  if (!flag_parse(argc, argv) || *help) {
+    fprintf(stderr, "Usage: %s [OPTIONS]\nOPTIONS:\n", argv[0]);
+    flag_print_options(stderr);
+    if (!*help)
+      flag_print_error(stderr);
+    return !*help;
+  }
 
-  int fft_rate = 8192*2;
+  int fft_rate = pow(2, *fft_rate_pow);
   float *samples = malloc(fft_rate * sizeof(float));
   float *window = malloc(fft_rate*sizeof(float));
   float *workbuffer = malloc((fft_rate + 2) * sizeof(float));
@@ -134,8 +146,12 @@ int main(int argc, char *argv[]) {
     fft_out,
     &fftr_cfg,
     fft_rate,
+    fft_rate/2 + 1,
+    *rms_min,
     0
   };
+
+  ma_result result;
   
   ma_device_config device_config = ma_device_config_init(ma_device_type_capture);
   device_config.capture.calculateLFEFromSpatialChannels = MA_TRUE;
@@ -143,8 +159,10 @@ int main(int argc, char *argv[]) {
   device_config.capture.channels = 1;
   device_config.capture.format = ma_format_f32;
   device_config.dataCallback = data_callback;
-  device_config.sampleRate = 0;
+  device_config.sampleRate = *sample_rate;
   device_config.pUserData = &userdata;
+  
+  // TODO: device enumeration
   
   ma_device device;
   result = ma_device_init(NULL, &device_config, &device);
@@ -153,16 +171,17 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  printf("Device sample rate: %d\n", device.sampleRate);
+  if (!*sample_rate)
+    printf("Device sample rate: %d\n", device.sampleRate);
+
+  userdata.k_min = round(*fmin * userdata.half_count / device.sampleRate);  
+  userdata.k_max = round(*fmax * userdata.half_count / device.sampleRate);  
 
   ma_device_start(&device);
 
   getchar();
 
   ma_device_uninit(&device);
-  free(samples);
-  free(fft_out);
-  free(fftr_cfg);
   
   return 0;
 }
